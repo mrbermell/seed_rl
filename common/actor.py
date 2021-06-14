@@ -82,7 +82,7 @@ def actor_loop(create_env_fn, config=None, log_period=1):
             high=np.iinfo(np.int64).max,
             size=env_batch_size,
             dtype=np.int64)
-        observation = batched_env.reset()
+        spat_obs, non_spat_obs, action_mask = batched_env.reset()
         reward = np.zeros(env_batch_size, np.float32)
         raw_reward = np.zeros(env_batch_size, np.float32)
         done = np.zeros(env_batch_size, np.bool)
@@ -101,31 +101,37 @@ def actor_loop(create_env_fn, config=None, log_period=1):
         last_log_time = timeit.default_timer()
         last_global_step = 0
         while True:
+          #print(f"step = {episode_step[0]}")
           tf.summary.experimental.set_step(actor_step)
-          env_output = utils.EnvOutput(reward, done, observation,
-                                       abandoned, episode_step)
+          env_output = utils.EnvOutput(reward, done, spat_obs, non_spat_obs, action_mask, abandoned, episode_step)
+
           with elapsed_inference_s_timer:
             action = client.inference(env_id, run_id, env_output, raw_reward)
           with timer_cls('actor/elapsed_env_step_s', 1000):
-            observation, reward, done, info = batched_env.step(action.numpy())
+
+            try:
+              reward, done, spat_obs, non_spat_obs, action_mask = batched_env.step(action.numpy())
+            except AssertionError as e:
+              assert False
           if is_rendering_enabled:
             batched_env.render()
           for i in range(env_batch_size):
             episode_step[i] += 1
             episode_return[i] += reward[i]
-            raw_reward[i] = float((info[i] or {}).get('score_reward',
-                                                      reward[i]))
+            raw_reward[i] = float(0)
+
             episode_raw_return[i] += raw_reward[i]
             # If the info dict contains an entry abandoned=True and the
             # episode was ended (done=True), then we need to specially handle
             # the final transition as per the explanations below.
-            abandoned[i] = (info[i] or {}).get('abandoned', False)
+            abandoned[i] = False
             assert done[i] if abandoned[i] else True
             if done[i]:
               # If the episode was abandoned, we need to report the final
               # transition including the final observation as if the episode has
               # not terminated yet. This way, learning algorithms can use the
               # transition for learning.
+              # TODO: Above statement may work poorly with how GotebotWrapper is implemented.
               if abandoned[i]:
                 # We do not signal yet that the episode was abandoned. This will
                 # happen for the transition from the terminal state to the
@@ -173,7 +179,7 @@ def actor_loop(create_env_fn, config=None, log_period=1):
           # from the terminal state to the resetted state in the next loop
           # iteration (with zero rewards).
           with timer_cls('actor/elapsed_env_reset_s', 10):
-            observation = batched_env.reset_if_done(done)
+            spat_obs, non_spat_obs, action_mask = batched_env.reset_if_done(done)
 
           if is_rendering_enabled and done[0]:
             batched_env.render()

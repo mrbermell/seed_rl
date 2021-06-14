@@ -501,11 +501,14 @@ def learner_loop(create_env_fn, create_agent_fn, create_optimizer_fn):
   settings = utils.init_learner(FLAGS.num_training_tpus)
   strategy, inference_devices, training_strategy, encode, decode = settings
   env = create_env_fn(0, FLAGS)
+  env.reset()
+  reward, done, spat_obs, nonspat_obs, action_mask = env.step(0)
   env_output_specs = utils.EnvOutput(
       tf.TensorSpec([], tf.float32, 'reward'),
       tf.TensorSpec([], tf.bool, 'done'),
-      tf.TensorSpec(env.observation_space.shape, env.observation_space.dtype,
-                    'observation'),
+      tf.TensorSpec(spat_obs.shape, spat_obs.dtype, 'spat_obs'),
+      tf.TensorSpec(nonspat_obs.shape, nonspat_obs.dtype, 'nonspat_obs'),
+      tf.TensorSpec(action_mask.shape, action_mask.dtype, 'action_mask'),
       tf.TensorSpec([], tf.bool, 'abandoned'),
       tf.TensorSpec([], tf.int32, 'episode_step'),
   )
@@ -781,11 +784,12 @@ def learner_loop(create_env_fn, create_agent_fn, create_optimizer_fn):
         for i, inference_device in enumerate(inference_devices)
     })
 
-    agent_outputs = agent_outputs._replace(
-        action=apply_epsilon_greedy(
-            agent_outputs.action, env_ids,
-            get_num_training_envs(),
-            FLAGS.num_eval_envs, FLAGS.eval_epsilon, num_actions))
+    # TODO: No exploration with this commented away
+    #agent_outputs = agent_outputs._replace(
+    #    action=apply_epsilon_greedy(
+    #        agent_outputs.action, env_ids,
+    #        get_num_training_envs(),
+    #        FLAGS.num_eval_envs, FLAGS.eval_epsilon, num_actions))
 
     # Append the latest outputs to the unroll, only for experience coming from
     # training environments (IDs < num_training_envs), and insert completed

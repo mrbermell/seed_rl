@@ -149,6 +149,18 @@ class BatchedEnvironment:
     self._env_ids = np.array(env_ids, np.int32)
     self._obs = None
 
+    env = create_env_fn(0, config)
+    env.reset()
+    reward, done, spat_obs, nonspat_obs, action_mask = env.step(0)
+    self._spat_obs_shape = [batch_size] + list(spat_obs.shape)
+    self._nonspat_obs_shape = [batch_size] + list(nonspat_obs.shape)
+    self._action_mask_shape = [batch_size] + list(action_mask.shape)
+    assert spat_obs.dtype == nonspat_obs.dtype
+    self._obs_dtype = spat_obs.dtype
+    self._action_mask_dtype = action_mask.dtype
+    env.close()
+    del env
+
   @property
   def env_ids(self):
     return self._env_ids
@@ -176,11 +188,13 @@ class BatchedEnvironment:
     num_envs = self._batch_size
     rewards = np.zeros(num_envs, np.float32)
     dones = np.zeros(num_envs, np.bool)
-    infos = [None] * num_envs
+    spat_obs = np.zeros(self._spat_obs_shape, dtype=self._obs_dtype)
+    non_spat_obs = np.zeros(self._nonspat_obs_shape, dtype=self._obs_dtype)
+    action_mask = np.zeros(self._action_mask_shape, dtype=self._action_mask_dtype)
     for i in range(num_envs):
-      self._obs[i], rewards[i], dones[i], infos[i] = self._envs[i].step(
-          action_batch[i])
-    return self._mapped_obs, rewards, dones, infos
+      rewards[i], dones[i], spat_obs[i], non_spat_obs[i], action_mask[i] = self._envs[i].step(action_batch[i])
+      self._obs[i] = (spat_obs[i], non_spat_obs[i], action_mask[i])
+    return rewards, dones, spat_obs, non_spat_obs, action_mask
 
   def reset(self):
     """Reset all environments."""
