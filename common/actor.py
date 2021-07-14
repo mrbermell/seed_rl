@@ -17,9 +17,11 @@ r"""SEED actor."""
 import os
 import timeit
 
+import botbowlcurriculum.Curriculum
 from absl import flags
 from absl import logging
 import numpy as np
+from pytest import set_trace
 from seed_rl import grpc
 from seed_rl.common import common_flags  
 from seed_rl.common import env_wrappers
@@ -82,11 +84,15 @@ def actor_loop(create_env_fn, config=None, log_period=1):
             high=np.iinfo(np.int64).max,
             size=env_batch_size,
             dtype=np.int64)
-        spat_obs, non_spat_obs, action_mask = batched_env.reset()
+
+        lecture_probs_and_levels = botbowlcurriculum.Curriculum.Academy(botbowlcurriculum.all_lectures).get_probs_and_levels()
+
+        spat_obs, non_spat_obs, action_mask = batched_env.reset(lecture_probs_and_levels)
         reward = np.zeros(env_batch_size, np.float32)
         raw_reward = np.zeros(env_batch_size, np.float32)
         done = np.zeros(env_batch_size, np.bool)
         abandoned = np.zeros(env_batch_size, np.bool)
+        lecture_outcomes = np.zeros((env_batch_size, 3), np.int32)
 
         global_step = 0
         episode_step = np.zeros(env_batch_size, np.int32)
@@ -106,7 +112,8 @@ def actor_loop(create_env_fn, config=None, log_period=1):
           env_output = utils.EnvOutput(reward, done, spat_obs, non_spat_obs, action_mask, abandoned, episode_step)
 
           with elapsed_inference_s_timer:
-            action = client.inference(env_id, run_id, env_output, raw_reward)
+            #set_trace()
+            action, lecture_probs_and_levels = client.inference(env_id, run_id, env_output, raw_reward, lecture_outcomes)
           with timer_cls('actor/elapsed_env_step_s', 1000):
 
             try:
@@ -115,10 +122,16 @@ def actor_loop(create_env_fn, config=None, log_period=1):
               assert False
           if is_rendering_enabled:
             batched_env.render()
+          lecture_outcomes = np.zeros((env_batch_size, 3), np.int32)
           for i in range(env_batch_size):
             episode_step[i] += 1
             episode_return[i] += reward[i]
             raw_reward[i] = float(0)
+
+            if episode_step[i] > 3000:
+              print("Too many steps in ffai env! ")
+            assert episode_step[i] < 800, "No ffai env should get more steps than that!"
+
 
             episode_raw_return[i] += raw_reward[i]
             # If the info dict contains an entry abandoned=True and the
@@ -126,27 +139,14 @@ def actor_loop(create_env_fn, config=None, log_period=1):
             # the final transition as per the explanations below.
             abandoned[i] = False
             assert done[i] if abandoned[i] else True
+            #print("print debugging!! ")
             if done[i]:
+              lecture_outcomes[i] = batched_env.envs[i].get_lecture_outcome()
               # If the episode was abandoned, we need to report the final
               # transition including the final observation as if the episode has
               # not terminated yet. This way, learning algorithms can use the
               # transition for learning.
               # TODO: Above statement may work poorly with how GotebotWrapper is implemented.
-              if abandoned[i]:
-                # We do not signal yet that the episode was abandoned. This will
-                # happen for the transition from the terminal state to the
-                # resetted state.
-                assert env_batch_size == 1 and i == 0, (
-                    'Mixing of batched and non-batched inference calls is not '
-                    'yet supported')
-                env_output = utils.EnvOutput(reward,
-                                             np.array([False]), observation,
-                                             np.array([False]), episode_step)
-                with elapsed_inference_s_timer:
-                  # action is ignored
-                  client.inference(env_id, run_id, env_output, raw_reward)
-                reward[i] = 0.0
-                raw_reward[i] = 0.0
 
               # Periodically log statistics.
               current_time = timeit.default_timer()
@@ -157,10 +157,9 @@ def actor_loop(create_env_fn, config=None, log_period=1):
               episodes_in_report += 1
               if current_time - last_log_time >= log_period:
                 logging.info(
-                    'Actor steps: %i, Return: %f Raw return: %f '
+                    'Actor steps: %i, Return: %f '
                     'Episode steps: %f, Speed: %f steps/s', global_step,
                     episode_return_sum / episodes_in_report,
-                    episode_raw_return_sum / episodes_in_report,
                     episode_step_sum / episodes_in_report,
                     (global_step - last_global_step) /
                     (current_time - last_log_time))
@@ -179,7 +178,7 @@ def actor_loop(create_env_fn, config=None, log_period=1):
           # from the terminal state to the resetted state in the next loop
           # iteration (with zero rewards).
           with timer_cls('actor/elapsed_env_reset_s', 10):
-            spat_obs, non_spat_obs, action_mask = batched_env.reset_if_done(done)
+            spat_obs, non_spat_obs, action_mask = batched_env.reset_if_done(done, lecture_probs_and_levels)
 
           if is_rendering_enabled and done[0]:
             batched_env.render()

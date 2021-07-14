@@ -196,13 +196,13 @@ class BatchedEnvironment:
       self._obs[i] = (spat_obs[i], non_spat_obs[i], action_mask[i])
     return rewards, dones, spat_obs, non_spat_obs, action_mask
 
-  def reset(self):
+  def reset(self, arg):
     """Reset all environments."""
-    observations = [env.reset() for env in self._envs]
+    observations = [env.reset(arg) for env in self._envs]
     self._obs = observations
     return self._mapped_obs
 
-  def reset_if_done(self, done):
+  def reset_if_done(self, done, arg):
     """Reset the environments for which 'done' is True.
 
     Args:
@@ -215,7 +215,7 @@ class BatchedEnvironment:
     assert self._obs is not None, 'reset_if_done() called before reset()'
     for i in range(len(self._envs)):
       if done[i]:
-        self._obs[i] = self.envs[i].reset()
+        self._obs[i] = self.envs[i].reset(arg)
 
     return self._mapped_obs
 

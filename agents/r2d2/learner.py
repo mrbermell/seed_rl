@@ -31,14 +31,19 @@ This contains all the features from R2D2
 import collections
 import concurrent.futures
 import math
+import queue
 import time
 
 from absl import flags
 from absl import logging
+from botbowlcurriculum import make_academy
+from pytest import set_trace
 from seed_rl import grpc
 from seed_rl.common import common_flags  
 from seed_rl.common import utils
 import tensorflow as tf
+import numpy as np
+from tensorflow.python.ops.data_flow_ops import FIFOQueue
 
 flags.DEFINE_integer('save_checkpoint_secs', 1800,
                      'Checkpoint save period in seconds.')
@@ -50,7 +55,7 @@ flags.DEFINE_float('replay_ratio', 1.5,
                    'used for training. '
                    'The default of 1.5 corresponds to an interpretation of the '
                    'R2D2 paper using the end of section 2.3.')
-flags.DEFINE_integer('inference_batch_size', -1,
+flags.DEFINE_integer('inference_batch_size', 8,
                      'Batch size for inference, -1 for auto-tune.')
 flags.DEFINE_integer('unroll_length', 100, 'Unroll length in agent steps.')
 flags.DEFINE_integer('num_training_tpus', 1, 'Number of TPUs for training.')
@@ -68,7 +73,7 @@ flags.DEFINE_float('priority_exponent', 0.9,
                    '0.9 comes from R2D2 paper, table 2.')
 flags.DEFINE_integer('unroll_queue_max_size', 100,
                      'Max size of the unroll queue')
-flags.DEFINE_integer('burn_in', 40,
+flags.DEFINE_integer('burn_in', 0,
                      'Length of the RNN burn-in prefix. This is the number of '
                      'time steps on which we update each stored RNN state '
                      'before computing the actual loss. The effective length '
@@ -84,7 +89,7 @@ flags.DEFINE_float('value_function_rescaling_epsilon', 1e-3,
 flags.DEFINE_integer('n_steps', 5,
                      'n-step returns: how far ahead we look for computing the '
                      'Bellman targets.')
-flags.DEFINE_float('discounting', .997, 'Discounting factor.')
+flags.DEFINE_float('discounting', .99, 'Discounting factor.')
 
 # Eval settings
 flags.DEFINE_float('eval_epsilon', 1e-3,
@@ -149,8 +154,13 @@ def get_envs_epsilon(env_ids, num_training_envs, num_eval_envs, eval_epsilon):
   return tf.gather(epsilons, env_ids)
 
 
+def random_action_from_mask(mask):
+  allowed = tf.cast(tf.squeeze(tf.where(mask), axis=1), dtype=tf.int32)
+  rand_int = tf.random.uniform((1,), 0, len(allowed), dtype=tf.int32)[0]
+  return allowed[rand_int]
+
 def apply_epsilon_greedy(actions, env_ids, num_training_envs,
-                         num_eval_envs, eval_epsilon, num_actions):
+                         num_eval_envs, eval_epsilon, action_mask):
   """Epsilon-greedy: randomly replace actions with given probability.
 
   Args:
@@ -160,7 +170,7 @@ def apply_epsilon_greedy(actions, env_ids, num_training_envs,
     num_training_envs: Number of training environments.
     num_eval_envs: Number of eval environments.
     eval_epsilon: Epsilon used for eval environments.
-    num_actions: Number of environment actions.
+    action_mask: <bool>[batch_size, num_actions]: action mask for each environment
 
   Returns:
     A new <int32>[batch_size] tensor with one action per environment. With
@@ -171,8 +181,9 @@ def apply_epsilon_greedy(actions, env_ids, num_training_envs,
   batch_size = tf.shape(actions)[0]
   epsilons = get_envs_epsilon(env_ids, num_training_envs, num_eval_envs,
                               eval_epsilon)
-  random_actions = tf.random.uniform([batch_size], maxval=num_actions,
-                                     dtype=tf.int32)
+
+  random_actions = tf.map_fn(random_action_from_mask, action_mask, fn_output_signature=tf.int32)
+
   probs = tf.random.uniform(shape=[batch_size])
   return tf.where(tf.math.less(probs, epsilons), random_actions, actions)
 
@@ -500,9 +511,15 @@ def learner_loop(create_env_fn, create_agent_fn, create_optimizer_fn):
   validate_config()
   settings = utils.init_learner(FLAGS.num_training_tpus)
   strategy, inference_devices, training_strategy, encode, decode = settings
+
+  # Initialize academy
+  academy = make_academy()
+  lecture_probs_and_levels = academy.get_probs_and_levels()
+  lecture_outcome_queue = FIFOQueue(10000, tf.int32)
+
   env = create_env_fn(0, FLAGS)
-  env.reset()
-  reward, done, spat_obs, nonspat_obs, action_mask = env.step(0)
+  spat_obs, nonspat_obs, action_mask = env.reset(lecture_probs_and_levels)
+
   env_output_specs = utils.EnvOutput(
       tf.TensorSpec([], tf.float32, 'reward'),
       tf.TensorSpec([], tf.bool, 'done'),
@@ -515,6 +532,8 @@ def learner_loop(create_env_fn, create_agent_fn, create_optimizer_fn):
   action_specs = tf.TensorSpec([], tf.int32, 'action')
   num_actions = env.action_space.n
   agent_input_specs = (action_specs, env_output_specs)
+
+
 
   # Initialize agent and variables.
   agent = create_agent_fn(env_output_specs, num_actions)
@@ -706,10 +725,11 @@ def learner_loop(create_env_fn, create_agent_fn, create_optimizer_fn):
       tf.TensorSpec([], tf.int64, 'run_id'),
       env_output_specs,
       tf.TensorSpec([], tf.float32, 'raw_reward'),
+      tf.TensorSpec([3], tf.int32, 'lecture_outcome')
   )
   inference_specs = tf.nest.map_structure(add_batch_size, inference_specs)
   @tf.function(input_signature=inference_specs)
-  def inference(env_ids, run_ids, env_outputs, raw_rewards):
+  def inference(env_ids, run_ids, env_outputs, raw_rewards, lecture_outcome):
     """Agent inference.
 
     This evaluates the agent policy on the provided environment data (reward,
@@ -732,6 +752,11 @@ def learner_loop(create_env_fn, create_agent_fn, create_optimizer_fn):
       A tensor <int32>[inference_batch_size] with one action for each
         environment.
     """
+    # Academy logging
+    #if tf.math.reduce_sum( tf.abs(lecture_outcome[:,2]))>0:
+    #    lecture_outcome_queue.enqueue(lecture_outcome)
+    lecture_outcome_queue.enqueue(lecture_outcome)
+
     # Reset the environments that had their first run or crashed.
     previous_run_ids = env_run_ids.read(env_ids)
     env_run_ids.replace(env_ids, run_ids)
@@ -784,12 +809,11 @@ def learner_loop(create_env_fn, create_agent_fn, create_optimizer_fn):
         for i, inference_device in enumerate(inference_devices)
     })
 
-    # TODO: No exploration with this commented away
-    #agent_outputs = agent_outputs._replace(
-    #    action=apply_epsilon_greedy(
-    #        agent_outputs.action, env_ids,
-    #        get_num_training_envs(),
-    #        FLAGS.num_eval_envs, FLAGS.eval_epsilon, num_actions))
+    agent_outputs = agent_outputs._replace(
+        action=apply_epsilon_greedy(
+            agent_outputs.action, env_ids,
+            get_num_training_envs(),
+            FLAGS.num_eval_envs, FLAGS.eval_epsilon, env_outputs[4]))
 
     # Append the latest outputs to the unroll, only for experience coming from
     # training environments (IDs < num_training_envs), and insert completed
@@ -835,7 +859,7 @@ def learner_loop(create_env_fn, create_agent_fn, create_optimizer_fn):
     actions.replace(env_ids, agent_outputs.action)
 
     # Return environment actions to environments.
-    return agent_outputs.action
+    return agent_outputs.action, lecture_probs_and_levels
 
   with strategy.scope():
     server.bind(inference)
@@ -890,7 +914,12 @@ def learner_loop(create_env_fn, create_agent_fn, create_optimizer_fn):
       # Max of gradient norms (before clipping) since last tf.summary export.
       max_gradient_norm_before_clip = max(gradient_norm.numpy(),
                                           max_gradient_norm_before_clip)
-      if current_time - last_log_time >= 120:
+
+      while lecture_outcome_queue.size()>0:
+        outcome = lecture_outcome_queue.dequeue()
+        academy.log_training(outcome)
+
+      if current_time - last_log_time >= 5:
         df = tf.cast(num_env_frames - last_num_env_frames, tf.float32)
         dt = time.time() - last_log_time
         tf.summary.scalar('num_environment_frames/sec (actors)', df / dt)
@@ -907,6 +936,18 @@ def learner_loop(create_env_fn, create_agent_fn, create_optimizer_fn):
         tf.summary.scalar('max_gradient_norm_before_clip',
                           max_gradient_norm_before_clip)
         max_gradient_norm_before_clip = 0.
+
+        # academy logging
+        keys = ['level', 'average_success', 'probability', 'max_level', 'num_episodes']
+        for report_dict in academy.get_report_dicts():
+          for key in keys:
+            tf.summary.scalar(f"{report_dict['name']}/{key}", report_dict[key])
+
+        academy.evaluate()
+        lecture_probs_and_levels = academy.get_probs_and_levels()
+
+      #if academy.lect_histo[2].index > 50:
+      #    set_trace()
 
   manager.save()
   server.shutdown()

@@ -13,15 +13,15 @@
 
 FROM tensorflow/tensorflow:2.3.0-gpu
 
-RUN apt-get update && apt-get install -y tmux ffmpeg libsm6 libxext6 libxrender-dev git
+RUN apt-get update && apt-get install -y tmux git vim htop
 
 # Install ffai environment
 RUN pip3 install gym
 RUN pip3 install tensorflow_probability==0.11.1
-RUN pip3 uninstall ffai --yes
-RUN pip3 install git+https://github.com/mrbermell/ffai.git@dependency_fix
-
-
+RUN pip3 install statsmodels
+RUN pip3 install git+https://github.com/mrbermell/ffai.git@c437c98945af104e4fa5f019d94f7ce39028c2f2
+RUN pip3 install git+https://github.com/mrbermell/BotBowlCurriculum.git@f9260ebf4fc5a81eacce0aa3f8d93e3be3aff694
+RUN pip3 install pytest
 
 # Copy SEED codebase and SEED GRPC binaries.
 ADD . /seed_rl/
